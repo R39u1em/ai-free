@@ -2,7 +2,8 @@
 
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import { Readable } from "node:stream";
+
+import { ReadableStream } from "node:stream/web";
 
 // До импорта модулей почистим env, чтобы дефолты читались детерминированно.
 delete process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
@@ -14,14 +15,25 @@ const { resolveHumanDelayMs } = await import("../src/code-agent/run.mjs");
 function stalledResponse(firstChunk, stallChunk) {
   // Первый чанк отдаётся сразу; второй — только через 10 c (гарантированно
   // позже watchdog на 3 c), поэтому тест не зависит от скорости CI-машины.
-  const readable = new Readable({ read() {} });
-  readable.push(firstChunk);
-  const timer = setTimeout(() => { try { readable.push(stallChunk); } catch {} }, 10_000);
+  // Используем web-ReadableStream: у него есть getReader()/cancel(), как у
+  // реального res.body в fetch-ответе.
+  let timer = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(firstChunk));
+      timer = setTimeout(() => {
+        try { controller.enqueue(new TextEncoder().encode(stallChunk)); } catch {}
+      }, 10_000);
+    },
+  });
+  // Держим ссылку на reader: после cancel() стрим «заблокирован» им, и
+  // повторный cancel() в cleanup вернул бы unhandled rejection.
+  const reader = stream.getReader();
   return {
-    response: { body: { getReader: () => readable.getReader() } },
+    response: { body: { getReader: () => reader } },
     cleanup: () => {
       clearTimeout(timer);
-      try { readable.destroy(); } catch {}
+      try { reader.cancel().catch(() => {}); } catch {}
     },
   };
 }

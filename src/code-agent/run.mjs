@@ -375,8 +375,11 @@ export function isTransientUpstreamTextError(text) {
 // Human-like пауза между шагами tool-loop (анти-бан). Диапазон: base..base*2,
 // по умолчанию 3000–8000 мс. AI_FREE_HUMAN_DELAY_MS=0 полностью выключает.
 export function resolveHumanDelayMs(env = process.env) {
-  const parsed = Number(env.AI_FREE_HUMAN_DELAY_MS ?? 3000);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  const raw = env.AI_FREE_HUMAN_DELAY_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 3_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 3_000;
+  if (parsed <= 0) return 0; // 0 или меньше = паузы выключены
   return Math.min(Math.floor(parsed), 60_000);
 }
 

@@ -8,8 +8,12 @@
 // прерывается ошибкой ds_stream_idle_timeout — выше по стеку её перехватит
 // retry-логика (_withReauth / transient retries) и повторит запрос.
 export function resolveDeepSeekStreamIdleTimeoutMs(env = process.env) {
-  const parsed = Number(env.DSCLI_STREAM_IDLE_TIMEOUT_MS ?? 20_000);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0; // 0 = выключен
+  const raw = env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
+  // Пустая/отсутствующая переменная = дефолт; нечисловое значение = дефолт.
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 20_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 20_000;
+  if (parsed <= 0) return 0; // 0 или меньше = watchdog выключен
   return Math.min(Math.floor(parsed), 600_000);
 }
 

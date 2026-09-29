@@ -271,6 +271,11 @@ export async function runCodeTask(
         return finish({ parentMessageId: parent, message, toolLogs });
       }
 
+      // Анти-бан: перед следующим запросом к провайдеру выдерживаем случайную
+      // «человеческую» паузу (имитация чтения результата и набора текста).
+      // Выключается через AI_FREE_HUMAN_DELAY_MS=0.
+      await humanStepDelay();
+
       const clarifications = takeInterrupts(options);
       const clarificationText = clarifications.length
         ? `\n\n${buildClarificationPrompt(clarifications)}`
@@ -365,6 +370,23 @@ export function resolveNoToolTextRetries(value) {
 
 export function isTransientUpstreamTextError(text) {
   return /allocated quota exceeded|quota\/token-limit|token-limit|too many requests|rate limit/i.test(String(text || ""));
+}
+
+// Human-like пауза между шагами tool-loop (анти-бан). Диапазон: base..base*2,
+// по умолчанию 3000–8000 мс. AI_FREE_HUMAN_DELAY_MS=0 полностью выключает.
+export function resolveHumanDelayMs(env = process.env) {
+  const raw = env.AI_FREE_HUMAN_DELAY_MS;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 3_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 3_000;
+  if (parsed <= 0) return 0; // 0 или меньше = паузы выключены
+  return Math.min(Math.floor(parsed), 60_000);
+}
+
+async function humanStepDelay() {
+  const base = resolveHumanDelayMs();
+  if (base <= 0) return;
+  await sleep(base + Math.random() * base);
 }
 
 function sleep(ms) {

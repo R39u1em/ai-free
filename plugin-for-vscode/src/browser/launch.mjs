@@ -5,6 +5,24 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
+// Флаги запуска Chromium для слабых машин: меньше RAM, нет фоновой телеметрии.
+// Отключать через AI_FREE_NO_PERF_ARGS=1 (например, при отладке антибот-поведения).
+const PERF_LAUNCH_ARGS = [
+  "--disable-dev-shm-usage",
+  "--disable-extensions",
+  "--disable-background-networking",
+  "--disable-sync",
+  "--disable-translate",
+  "--metrics-recording-only",
+  "--no-first-run",
+  "--safebrowsing-disable-auto-update",
+];
+
+function perfLaunchArgs() {
+  if (process.env.AI_FREE_NO_PERF_ARGS === "1") return [];
+  return [...PERF_LAUNCH_ARGS];
+}
+
 // Поднять persistent Chromium-профиль для DeepSeek/Qwen/ChatGPT. headless=false —
 // видимое окно, true — для тихого refresh из профиля. Чистит stale SingletonLock-файлы от падений.
 export async function launchPersistentDeepSeekContext(chromium, profileDir, headless, overrides = {}) {
@@ -12,8 +30,14 @@ export async function launchPersistentDeepSeekContext(chromium, profileDir, head
   const options = {
     headless,
     viewport: null,
-    args: ["--disable-blink-features=AutomationControlled"],
+    // Не отдаём automation-флаг браузеру — patchright сам управляет fingerprint'ами.
+    ignoreDefaultArgs: ["--enable-automation"],
     ...overrides,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      ...perfLaunchArgs(),
+      ...(Array.isArray(overrides.args) ? overrides.args : []),
+    ],
   };
   const preferredChannel = Object.prototype.hasOwnProperty.call(overrides, "channel")
     ? overrides.channel

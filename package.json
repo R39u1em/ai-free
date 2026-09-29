@@ -50,6 +50,7 @@
   "scripts": {
     "postinstall": "patchright install chromium && playwright install chromium",
     "start": "node ./bin/deepseek.mjs --window",
+    "start-silent": "node scripts/start-silent.js",
     "window": "node ./bin/deepseek.mjs --window",
     "server": "node ./bin/deepseek.mjs --no-window",
     "cli": "node ./bin/deepseek.mjs",

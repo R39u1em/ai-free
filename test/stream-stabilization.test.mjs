@@ -10,7 +10,8 @@ delete process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
 delete process.env.AI_FREE_HUMAN_DELAY_MS;
 
 const { streamSse, resolveDeepSeekStreamIdleTimeoutMs } = await import("../src/providers/deepseek/sse.mjs");
-const { resolveHumanDelayMs } = await import("../src/code-agent/run.mjs");
+const { resolveHumanDelayMs, resolveHumanDelayRangeMs } = await import("../src/code-agent/run.mjs");
+delete process.env.AI_FREE_HUMAN_DELAY_MAX_MS;
 
 function stalledResponse(firstChunk, stallChunk) {
   // Первый чанк отдаётся сразу; второй — только через 10 c (гарантированно
@@ -88,18 +89,30 @@ describe("streamSse idle timeout", () => {
   });
 });
 
-describe("resolveHumanDelayMs", () => {
-  it("defaults to 3000ms base", () => {
-    assert.equal(resolveHumanDelayMs({}), 3_000);
+describe("resolveHumanDelayMs / resolveHumanDelayRangeMs", () => {
+  it("defaults to 5000–15000ms range (anti-ban for DeepSeek)", () => {
+    assert.equal(resolveHumanDelayMs({}), 5_000);
+    assert.deepEqual(resolveHumanDelayRangeMs({}), { min: 5_000, max: 15_000 });
   });
 
   it("0 or negative disables anti-ban pauses", () => {
     assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "0" }), 0);
     assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "-5" }), 0);
+    assert.deepEqual(resolveHumanDelayRangeMs({ AI_FREE_HUMAN_DELAY_MS: "0" }), { min: 0, max: 0 });
+  });
+
+  it("honors explicit max env override", () => {
+    assert.deepEqual(
+      resolveHumanDelayRangeMs({ AI_FREE_HUMAN_DELAY_MS: "8000", AI_FREE_HUMAN_DELAY_MAX_MS: "20000" }),
+      { min: 8_000, max: 20_000 },
+    );
   });
 
   it("clamps absurd values", () => {
     assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "120000" }), 60_000);
-    assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "not-a-number" }), 3_000);
+    assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "not-a-number" }), 5_000);
+    // max никогда не бывает меньше min
+    const r = resolveHumanDelayRangeMs({ AI_FREE_HUMAN_DELAY_MS: "10000", AI_FREE_HUMAN_DELAY_MAX_MS: "2000" });
+    assert.equal(r.max, r.min);
   });
 });

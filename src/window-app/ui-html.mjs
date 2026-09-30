@@ -25,6 +25,7 @@ export function renderWindowHtml({ language: requestedLanguage = "", ui = {} } =
   <div class="app">
     <aside class="sidebar">
       <nav class="sidebarMenu" aria-label="${t("sidebar.menu")}">
+        <button type="button" id="mobileCloseChats" class="iconBtn mobileCloseChats" aria-label="${t("app.close")}">✕</button>
         <button type="button" id="sidebarMenuPlugins" class="sidebarMenuBtn">${t("sidebar.plugins")}</button>
         <button type="button" id="sidebarMenuTelegram" class="sidebarMenuBtn">${t("sidebar.telegram")}</button>
       </nav>
@@ -166,6 +167,7 @@ export function renderWindowHtml({ language: requestedLanguage = "", ui = {} } =
     <main class="main">
       <header class="topbar">
         <div id="activeTitleRow" class="titleRow topbarTitle">
+          <button type="button" id="mobileChatsBtn" class="iconBtn mobileChatsBtn" aria-label="${t("app.workspace")}">☰</button>
           <div id="activeTitle" class="title">${t("app.noChat")}</div>
           <div id="workspace" class="workspace"></div>
         </div>
@@ -324,6 +326,8 @@ export function renderWindowHtml({ language: requestedLanguage = "", ui = {} } =
     const progressiveTextState = new Map();
 
     const chatList = document.getElementById("chatList");
+    document.getElementById("mobileChatsBtn")?.addEventListener("click", () => document.body.classList.add("mobileSidebarOpen"));
+    document.getElementById("mobileCloseChats")?.addEventListener("click", () => document.body.classList.remove("mobileSidebarOpen"));
     const deleteChatOverlay = document.getElementById("deleteChatOverlay");
     const deleteChatName = document.getElementById("deleteChatName");
     const deleteChatConfirm = document.getElementById("deleteChatConfirm");
@@ -1716,6 +1720,7 @@ export function renderWindowHtml({ language: requestedLanguage = "", ui = {} } =
           }
         });
         const openConversation = async () => {
+          document.body.classList.remove("mobileSidebarOpen");
           const data = await api("/api/conversations/" + conversation.id);
           appState.activeConversationId = conversation.id;
           activeConversation = data.conversation;

@@ -5,6 +5,15 @@ import os from "node:os";
 import path from "node:path";
 
 describe("background task runner tracing", () => {
+  it("keeps a long-running code task owned until it actually finishes", async () => {
+    const { startTask, isRunning, getTaskInfo, stopTask } = await import(`../src/window-app/task-runner.mjs?long-test=${Date.now()}`);
+    const id = `long-${Date.now()}`;
+    startTask(id, "code", (signal) => new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true })));
+    getTaskInfo(id).startedAt -= 21 * 60 * 1000;
+    assert.equal(isRunning(id), true);
+    assert.throws(() => startTask(id, "code", async () => {}), /already running/);
+    stopTask(id);
+  });
   it("records correlated success, failure, and cancellation lifecycles", async () => {
     const logDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai-free-task-trace-"));
     const previousLogDir = process.env.AI_FREE_LOG_DIR;

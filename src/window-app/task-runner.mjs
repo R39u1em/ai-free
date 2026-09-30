@@ -9,7 +9,7 @@
 //   3. UI делает polling GET /api/state каждую секунду, видит running: true
 //   4. Когда taskFn завершается — running удаляется из Map, UI видит готовое сообщение
 //
-// Состояние НЕ персистится — при рестарте сервера задачи теряются (это OK для MVP).
+// Активный процесс хранится здесь; checkpoint code-агента сохраняется в state.json.
 
 import { createFileLogger } from "../logging/logger.mjs";
 import { createTaskTrace } from "../logging/task-trace.mjs";
@@ -26,6 +26,9 @@ function resolveStaleTaskMs(value) {
 
 function isTaskStale(task) {
   if (!task) return false;
+  // Code/browser runs may wait for provider recovery for hours. They retain
+  // ownership until completion or an explicit Stop, preventing duplicate work.
+  if (task.kind === "code") return false;
   return Date.now() - task.startedAt > task.staleAfterMs;
 }
 

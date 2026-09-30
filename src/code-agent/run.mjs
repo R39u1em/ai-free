@@ -16,6 +16,7 @@ import {
   shouldRejectTextOnlyCodeResult,
 } from "./loop-helpers.mjs";
 import { createFileLogger, withLogSpan } from "../logging/logger.mjs";
+import { isRecoverableModelError, scheduledModelRequest } from "./request-policy.mjs";
 
 const agentLogger = createFileLogger({ component: "code-agent" });
 const completeModelWithLogging = withLogSpan(
@@ -76,7 +77,7 @@ export async function runCodeTask(
   const availableNativeTools = nativeTools
     ? NATIVE_CODE_TOOLS.filter((tool) => isToolAllowed(tool.function.name, allowedTools))
     : null;
-  const resumeState = nativeTools && options.resumeState && typeof options.resumeState === "object"
+  const resumeState = options.resumeState && typeof options.resumeState === "object"
     ? options.resumeState
     : null;
   let pendingToolResult = resumeState?.pendingToolResult || null;
@@ -109,6 +110,9 @@ export async function runCodeTask(
   );
   let noToolRetries = 0;
   let repairingMissingTool = false;
+  const retryDelaysMs = options.retryDelaysMs || [];
+  const retryDeadline = Date.now() + (options.retryWindowMs ?? Infinity);
+  let failures = 0;
 
   const memoryUsedCount = Number(options.memoryUsedCount) || 0;
   const graphUsedCount = Number(options.graphUsedCount) || 0;
@@ -124,7 +128,7 @@ export async function runCodeTask(
     browserOnly,
   });
 
-  for (let step = 0; step < maxToolSteps; step += 1) {
+  for (let step = Number(resumeState?.step) || 0; step < maxToolSteps; step += 1) {
     if (options.signal?.aborted) {
       const message = "⏹ Остановлено пользователем.";
       options.onAssistant?.(message);
@@ -134,14 +138,18 @@ export async function runCodeTask(
     let transientTextRetries = 0;
 
     for (;;) {
-      options.onCheckpoint?.({
+      const checkpoint = {
         task,
+        step,
         prompt,
         pendingToolResult,
         parentMessageId: parent,
         toolLogs: [...toolLogs],
-      });
-      const result = await completeModelWithLogging(client, {
+      };
+      options.onCheckpoint?.(checkpoint);
+      let result;
+      try {
+        result = await scheduledModelRequest(options.providerId, () => completeModelWithLogging(client, {
         ...baseOptions,
         ...(repairingMissingTool ? { searchEnabled: false } : {}),
         prompt,
@@ -151,7 +159,39 @@ export async function runCodeTask(
           tools: availableNativeTools,
           toolResult: pendingToolResult,
         } : {}),
-      });
+        }), {
+          delay: options.requestDelay,
+          signal: options.signal,
+          backoffMs: failures ? retryDelaysMs[Math.min(failures - 1, retryDelaysMs.length - 1)] || 0 : 0,
+        });
+        if (!result?.toolCall && !String(result?.text || '').trim()) throw new Error('empty stream');
+        if (!result?.toolCall && /^\s*\{\s*"tool"\s*:/.test(String(result?.text || '')) && !parseToolCall(result.text)) {
+          const incomplete = new Error('incomplete tool response from model stream');
+          incomplete.retryable = true;
+          throw incomplete;
+        }
+        if (retryDelaysMs.length && (result?.error || isTransientUpstreamTextError(result?.text))) {
+          const providerError = new Error(String(result.error || result.text).slice(0, 500));
+          providerError.retryable = !result.error;
+          throw providerError;
+        }
+        failures = 0;
+      } catch (error) {
+        if (!options.signal?.aborted && retryDelaysMs.length && isRecoverableModelError(error) && Date.now() < retryDeadline) {
+          failures += 1;
+          if (Number(error?.status || error?.httpStatus) === 429 || /rate limit|too many requests|quota/i.test(String(error?.message || ''))) {
+            failures = Math.max(failures, retryDelaysMs.length);
+          }
+          options.onRetry?.({ attempt: failures, error: error.message, checkpoint });
+          continue;
+        }
+        throw error;
+      }
+      if (options.signal?.aborted) {
+        const message = "⏹ Остановлено пользователем.";
+        options.onAssistant?.(message);
+        return finish({ parentMessageId: parent, message, toolLogs, stopped: true });
+      }
       pendingToolResult = null;
       const nextParent = result.lastAssistantMessageId ?? parent;
       const call = result.toolCall
@@ -228,6 +268,7 @@ export async function runCodeTask(
         break;
       }
 
+      options.onToolIntent?.({ ...checkpoint, parentMessageId: parent, tool: call });
       let toolResult;
       try {
         const commandPermissions = {
@@ -288,6 +329,7 @@ export async function runCodeTask(
         clarifications: clarificationText,
         browserOnly,
       });
+      options.onCheckpoint?.({ task, step: step + 1, prompt, pendingToolResult, parentMessageId: parent, toolLogs: [...toolLogs] });
       break;
     }
   }

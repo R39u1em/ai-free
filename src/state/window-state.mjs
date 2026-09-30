@@ -110,7 +110,13 @@ export function saveWindowState(workspaceRoot, state) {
 
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (fs.existsSync(file)) fs.copyFileSync(file, backupFile);
-  fs.writeFileSync(file, JSON.stringify(normalized, null, 2), "utf8");
+  const temporary = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(normalized, null, 2), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch {}
+  }
 }
 
 export function createEmptyState(workspaceRoot) {

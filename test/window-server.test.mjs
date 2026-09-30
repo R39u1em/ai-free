@@ -8,7 +8,32 @@ import {
   isChatGPTLoginRecoveryRequired,
   shouldAutoRunCodeTask,
 } from "../src/window-app/server.mjs";
-import { resolveConversationAgentTask } from "../src/window-app/agent-task.mjs";
+import { applyAgentModePatch, resolveConversationAgentTask, shouldRunPipeline } from "../src/window-app/agent-task.mjs";
+
+describe("agent mode precedence", () => {
+  it("turning on Coder clears Pipeline so code tasks reach the agent", () => {
+    const conversation = { pipelineMode: true, coderMode: false, hardwareMode: false };
+    applyAgentModePatch(conversation, { coderMode: true });
+    assert.deepEqual([conversation.pipelineMode, conversation.coderMode], [false, true]);
+    assert.equal(shouldRunPipeline(conversation, {}, "создай файл notes.txt"), false);
+  });
+
+  it("turning on Pipeline clears Coder and ESP", () => {
+    const conversation = { pipelineMode: false, coderMode: true, hardwareMode: true };
+    applyAgentModePatch(conversation, { pipelineMode: true });
+    assert.deepEqual([conversation.pipelineMode, conversation.coderMode, conversation.hardwareMode], [true, false, false]);
+    assert.equal(shouldRunPipeline(conversation, {}, "обычное сообщение"), true);
+  });
+
+  it("an explicit code command bypasses a stored Pipeline mode", () => {
+    assert.equal(shouldRunPipeline({ pipelineMode: true }, {}, "/code создай файл notes.txt"), false);
+    assert.equal(shouldRunPipeline({ pipelineMode: true }, { pipeline: true }, "/code создай файл notes.txt"), true);
+  });
+
+  it("an explicit browser action bypasses a stored Pipeline mode", () => {
+    assert.equal(shouldRunPipeline({ pipelineMode: true }, {}, "открой example.com в браузере"), false);
+  });
+});
 
 describe("shouldAutoRunCodeTask", () => {
   it("routes direct project work to the code agent", () => {

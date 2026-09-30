@@ -23,6 +23,11 @@ import {
 } from "../state/settings.mjs";
 import { conversationList, makeConversationTitle, shouldAutoTitle } from "../state/conversations.mjs";
 import { startTask, isRunning, getRunningIds, stopTask } from "./task-runner.mjs";
+import { agentPauseReason, agentRequestOptions, pausedAuthAgentRuns, recoverableAgentRuns } from "./agent-recovery.mjs";
+import { normalizeBasePath, prefixUiPaths, resolveUiRequestPath } from "./base-path.mjs";
+import { mergeVisiblePipeline, projectPipeline } from "./pipeline-scope.mjs";
+import { remoteSettingsInput, remoteSettingsResponse } from "./remote-settings.mjs";
+import { remoteUiRouteDenied } from "./remote-route-policy.mjs";
 import { getShutdownStatus, registerShutdownServerCloser, requestAppShutdown } from "../app-shutdown.mjs";
 import { getStateFile, loadWindowState, saveWindowState } from "../state/window-state.mjs";
 import { LANGUAGES, getLanguageMeta } from "../i18n/index.mjs";
@@ -39,7 +44,7 @@ import {
 } from "./http.mjs";
 import { renderWindowHtml } from "./ui-html.mjs";
 import { renderEmbedWorkspaceHtml } from "./embed-workspace.mjs";
-import { renderEmbedBrowserHtml } from "./embed-browser.mjs";
+import { preferredBrowserTab, renderEmbedBrowserHtml } from "./embed-browser.mjs";
 import {
   handleChatGPTLiveInput,
   handleChatGPTLiveStream,
@@ -67,9 +72,11 @@ import {
 } from "./provider-frame-chatgpt.mjs";
 import {
   AGENT_TASK_EMPTY_HELP,
+  applyAgentModePatch,
   buildAgentTaskOptions,
   finalizeCodeTaskMessage,
   resolveConversationAgentTask,
+  shouldRunPipeline,
 } from "./agent-task.mjs";
 import { handleMemoryRoute } from "./routes/memory.mjs";
 import { handleSkillsRoute } from "./routes/skills.mjs";
@@ -133,6 +140,110 @@ export async function runWindowApp({
   }
 
   const state = loadWindowState(workspaceRoot);
+  const basePath = normalizeBasePath(process.env.AI_FREE_BASE_PATH || "");
+  const remoteRoots = String(process.env.AI_FREE_REMOTE_WORKSPACES || "/Users/kirill/work/repos")
+    .split(",").map((value) => value.trim()).filter(Boolean).map((value) => path.resolve(value));
+  const remoteWorkspaceAllowed = (candidate) => {
+    const resolved = path.resolve(String(candidate || ""));
+    let actual = resolved;
+    try { actual = fs.realpathSync(resolved); } catch {
+      const parent = path.dirname(resolved);
+      try { actual = path.join(fs.realpathSync(parent), path.basename(resolved)); } catch { return false; }
+    }
+    return remoteRoots.some((root) => actual === root || actual.startsWith(root + path.sep));
+  };
+
+  function markAgentRun(conversation, progressMessage, task, baseOptions, parentId, agentInput, body) {
+    progressMessage.agentRun = {
+      status: "running",
+      task,
+      baseOptions,
+      parentId,
+      browserOnly: agentInput.browserOnly === true,
+      skillId: agentInput.skillId || null,
+      memoryEnabled: body.memoryEnabled !== false,
+      autoSkill: body.autoSkill !== false,
+      agentOptions: buildAgentTaskOptions(conversation, body, {
+        hardwareMode: conversation.hardwareMode === true,
+        systemPrompt: conversation.hardwareMode === true ? createHardwareAgentPrompt() : "",
+        agentInput,
+      }),
+      checkpoint: null,
+      toolInFlight: null,
+    };
+  }
+
+  function persistentAgentOptions(conversation, progressMessage, adapter) {
+    return agentRequestOptions({ conversation, message: progressMessage, state, workspaceRoot, saveState: saveWindowState, adapter });
+  }
+
+  async function resumeAgentRun(conversation, progressMessage) {
+    const run = progressMessage.agentRun;
+    if (!run || isRunning(conversation.id)) return;
+    let adapter = client;
+    if (conversation.provider === "qwen") {
+      const { createQwenAgentAdapter } = await import("../providers/qwen/agent-adapter.mjs");
+      adapter = createQwenAgentAdapter({ complete: async (opts) => {
+        if (!conversation.sessionId) {
+          conversation.sessionId = await qwenApiCall((qwen) => qwen.createChat({ model: conversation.model || undefined }));
+          saveWindowState(workspaceRoot, state);
+        }
+        return qwenApiCall((qwen) => qwen.complete({ ...opts, chatId: opts.chatId || conversation.sessionId }));
+      } });
+      adapter.activeChatId = run.activeChatId || null;
+    } else if (conversation.provider === "chatgpt") {
+      const { createChatGPTAgentAdapter } = await import("../providers/chatgpt/agent-adapter.mjs");
+      adapter = createChatGPTAgentAdapter(await getOrCreateChatGPTClient(), {
+        conversationId: conversation.sessionId || null,
+        model: conversation.model || null,
+        onConversationId: (id) => { conversation.sessionId = id; saveWindowState(workspaceRoot, state); },
+      });
+    }
+    startTask(conversation.id, "code", async (signal) => {
+      try {
+        const memorySavedHandler = createCodeMemorySavedHandler({
+          conversation, progressMessage, workspaceRoot, state, saveWindowState,
+        });
+        const result = await runAgentTask(adapter, run.baseOptions || {},
+          path.resolve(conversation.workspace || workspaceRoot), run.task, run.parentId || null, {
+            signal,
+            ...(run.agentOptions || {}),
+            browserOnly: run.browserOnly,
+            skillId: run.skillId,
+            memoryEnabled: run.memoryEnabled,
+            autoSkill: run.autoSkill,
+            compactInitialPrompt: Boolean(run.parentId),
+            resumeState: run.checkpoint || null,
+            ...persistentAgentOptions(conversation, progressMessage, adapter),
+            onMemorySaved: memorySavedHandler,
+            takeInterrupts: () => takeRunningClarifications(conversation),
+            onTool: (_call, toolResult, log) => {
+              captureInstallRequest(conversation, toolResult);
+              captureQuestionRequest(conversation, toolResult);
+              capturePermissionRequest(conversation, toolResult);
+              progressMessage.toolLogs = [...(progressMessage.toolLogs || []), log];
+              progressMessage.content = formatCodeProgressMessage(run.task, progressMessage.toolLogs, { browserOnly: run.browserOnly });
+              saveWindowState(workspaceRoot, state);
+            },
+          });
+        conversation.codeParentMessageId = result.parentMessageId ?? conversation.codeParentMessageId;
+        conversation.codeAgentPromptVersion = CODE_AGENT_PROMPT_VERSION;
+        if (adapter.getConversationId) conversation.sessionId = adapter.getConversationId() || conversation.sessionId;
+        conversation.lastAgentMeta = result.agentMeta;
+        progressMessage.toolLogs = [...result.toolLogs];
+        progressMessage.content = finalizeCodeTaskMessage(result).content;
+        delete progressMessage.streaming;
+        delete progressMessage.agentRun;
+      } catch (error) {
+        run.status = signal.aborted ? "stopped" : "paused";
+        run.pauseReason = signal.aborted ? null : agentPauseReason(error);
+        progressMessage.content = signal.aborted ? "⏹ Остановлено пользователем." : `⚠️ /code приостановлен: ${error.message}`;
+        delete progressMessage.streaming;
+      }
+      conversation.updatedAt = new Date().toISOString();
+      saveWindowState(workspaceRoot, state);
+    }, `Resume ${conversation.provider || "deepseek"} /code`);
+  }
 
   setImmediate(() => {
     warmMemoryBackend().catch(() => {});
@@ -415,10 +526,11 @@ export async function runWindowApp({
     return qwenLiveModelSupportsSearch(catalog, modelId);
   }
 
-  async function runPipelineFromConversation(startConversationId, initialPrompt, requestOptions = {}, signal = null) {
+  async function runPipelineFromConversation(startConversationId, initialPrompt, requestOptions = {}, signal = null, allowedWorkspace = null) {
     const edges = state.pipeline?.edges || [];
     const configuredLeader = String(state.pipeline?.mainAgentId || "");
-    const leaderId = state.conversations.some((item) => item.id === configuredLeader)
+    const eligible = (item) => !allowedWorkspace || allowedWorkspace(item.workspace || workspaceRoot);
+    const leaderId = state.conversations.some((item) => item.id === configuredLeader && eligible(item))
       ? configuredLeader
       : startConversationId;
     const queue = [{ conversationId: leaderId, input: initialPrompt, sourceTitle: "User", depth: 0 }];
@@ -430,7 +542,7 @@ export async function runWindowApp({
       if (signal?.aborted) break;
       const item = queue.shift();
       const conversation = state.conversations.find((candidate) => candidate.id === item.conversationId);
-      if (!conversation) continue;
+      if (!conversation || !eligible(conversation)) continue;
       const visitKey = `${item.conversationId}:${item.depth}`;
       if (visited.has(visitKey)) continue;
       visited.add(visitKey);
@@ -459,7 +571,7 @@ export async function runWindowApp({
       const targets = edges
         .filter((edge) => edge.from === item.conversationId)
         .map((edge) => state.conversations.find((candidate) => candidate.id === edge.to))
-        .filter(Boolean);
+        .filter((candidate) => candidate && eligible(candidate));
       for (const target of targets) {
         queue.push({
           conversationId: target.id,
@@ -620,16 +732,35 @@ export async function runWindowApp({
     });
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
+      const prefixedPath = basePath ? resolveUiRequestPath(url.pathname, basePath) : null;
+      const remote = prefixedPath !== null;
+      if (remote) url.pathname = prefixedPath;
+      if (remote) {
+        const origin = req.headers.origin;
+        if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && origin !== "https://main.r3quiem.ru") {
+          return sendJson(res, { error: "Origin denied" }, 403);
+        }
+        if (remoteUiRouteDenied(url.pathname, req.method)) {
+          return sendJson(res, { error: "Unavailable through main" }, 403);
+        }
+        const conversationId = url.pathname.match(/^\/api\/conversations\/([^/]+)/)?.[1];
+        if (conversationId) {
+          const selected = state.conversations.find((item) => item.id === conversationId);
+          if (!selected || !remoteWorkspaceAllowed(selected.workspace || workspaceRoot)) {
+            return sendJson(res, { error: "Workspace unavailable through main" }, 403);
+          }
+        }
+      }
 
       if (req.method === "GET" && url.pathname === "/") {
         const settings = loadSettings();
-        return sendHtml(res, renderWindowHtml({
+        return sendHtml(res, prefixUiPaths(renderWindowHtml({
           language: settings.ui?.language,
           ui: {
             language: settings.ui?.language || "ru",
             webSearchDefault: settings.ui?.webSearchDefault !== false,
           },
-        }));
+        }), remote ? basePath : ""));
       }
 
       if (req.method === "GET" && url.pathname.startsWith("/api/chat-images/")) {
@@ -650,13 +781,18 @@ export async function runWindowApp({
       }
 
       if (req.method === "GET" && url.pathname === "/embed/workspace") {
-        const root = url.searchParams.get("root") || workspaceRoot || os.homedir();
-        return sendHtml(res, renderEmbedWorkspaceHtml({ root, title: "Workspace" }));
+        const root = url.searchParams.get("root") || (remote ? remoteRoots[0] : workspaceRoot || os.homedir());
+        if (remote && !remoteWorkspaceAllowed(root)) return sendJson(res, { error: "Workspace unavailable" }, 403);
+        return sendHtml(res, prefixUiPaths(renderEmbedWorkspaceHtml({ root, title: "Workspace" }), remote ? basePath : ""));
       }
 
       if (req.method === "GET" && url.pathname === "/embed/browser") {
-        const root = url.searchParams.get("root") || workspaceRoot || os.homedir();
-        return sendHtml(res, renderEmbedBrowserHtml({ root }));
+        const root = url.searchParams.get("root") || (remote ? remoteRoots[0] : workspaceRoot || os.homedir());
+        if (remote && !remoteWorkspaceAllowed(root)) return sendJson(res, { error: "Workspace unavailable" }, 403);
+        return sendHtml(res, prefixUiPaths(renderEmbedBrowserHtml({
+          root,
+          defaultTab: preferredBrowserTab(url.searchParams.get("provider")),
+        }), remote ? basePath : ""));
       }
 
       if (req.method === "GET" && url.pathname === "/embed/chatgpt") {
@@ -666,11 +802,11 @@ export async function runWindowApp({
       }
 
       if (req.method === "GET" && url.pathname === "/embed/chatgpt-live") {
-        return sendHtml(res, renderEmbedChatGPTLiveHtml());
+        return sendHtml(res, prefixUiPaths(renderEmbedChatGPTLiveHtml(), remote ? basePath : ""));
       }
 
       if (req.method === "GET" && url.pathname === "/embed/web-live") {
-        return sendHtml(res, renderEmbedAppBrowserLiveHtml());
+        return sendHtml(res, prefixUiPaths(renderEmbedAppBrowserLiveHtml(), remote ? basePath : ""));
       }
 
       if (req.method === "GET" && url.pathname === "/api/browser/live-stream") {
@@ -933,6 +1069,20 @@ export async function runWindowApp({
           loginJob
             .then(() => {
               providerLoginStates.set(providerId, { state: "completed", error: "" });
+              for (const [conversation, progressMessage] of pausedAuthAgentRuns(state.conversations, providerId)) {
+                progressMessage.agentRun.status = "running";
+                progressMessage.agentRun.pauseReason = null;
+                progressMessage.streaming = true;
+                progressMessage.content = `⏳ Продолжаю /code после входа в ${providerId}…`;
+                saveWindowState(workspaceRoot, state);
+                setImmediate(() => resumeAgentRun(conversation, progressMessage).catch((error) => {
+                  progressMessage.agentRun.status = "paused";
+                  progressMessage.agentRun.pauseReason = agentPauseReason(error);
+                  progressMessage.content = `⚠️ /code приостановлен: ${error.message}`;
+                  delete progressMessage.streaming;
+                  saveWindowState(workspaceRoot, state);
+                }));
+              }
             })
             .catch((error) => {
               providerLoginStates.set(providerId, { state: "error", error: error.message || String(error) });
@@ -1026,21 +1176,30 @@ export async function runWindowApp({
       }
 
       if (req.method === "GET" && url.pathname === "/api/state") {
+        const visibleConversations = remote
+          ? state.conversations.filter((item) => remoteWorkspaceAllowed(item.workspace || workspaceRoot))
+          : state.conversations;
+        const visibleIds = new Set(visibleConversations.map((item) => item.id));
         return sendJson(res, {
-          workspaceRoot,
-          stateFile: getStateFile(),
-          activeConversationId: state.activeConversationId,
-          conversations: conversationList(state),
-          pipeline: state.pipeline || { edges: [] },
-          runningTaskIds: getRunningIds(),
+          workspaceRoot: remote ? remoteRoots[0] : workspaceRoot,
+          stateFile: remote ? null : getStateFile(),
+          activeConversationId: visibleIds.has(state.activeConversationId) ? state.activeConversationId : null,
+          conversations: conversationList({ ...state, conversations: visibleConversations }),
+          pipeline: remote ? projectPipeline(state.pipeline || { edges: [] }, visibleIds) : state.pipeline || { edges: [] },
+          runningTaskIds: getRunningIds().filter((id) => visibleIds.has(id)),
         });
       }
 
       if (req.method === "PATCH" && url.pathname === "/api/pipeline") {
         const body = await readJsonBody(req);
-        state.pipeline = normalizePipelinePatch(body, state.conversations);
+        const visibleConversations = remote
+          ? state.conversations.filter((item) => remoteWorkspaceAllowed(item.workspace || workspaceRoot))
+          : state.conversations;
+        const patch = normalizePipelinePatch(body, visibleConversations);
+        const visibleIds = new Set(visibleConversations.map((item) => item.id));
+        state.pipeline = remote ? mergeVisiblePipeline(state.pipeline, patch, visibleIds) : patch;
         saveWindowState(workspaceRoot, state);
-        return sendJson(res, { pipeline: state.pipeline });
+        return sendJson(res, { pipeline: remote ? projectPipeline(state.pipeline, visibleIds) : state.pipeline });
       }
 
       // ===== Файловый браузер для модалки «Новый чат» =====
@@ -1056,6 +1215,9 @@ export async function runWindowApp({
         }
         const parent = path.resolve(parentRaw);
         const target = path.join(parent, name);
+        if (remote && (!remoteWorkspaceAllowed(parent) || !remoteWorkspaceAllowed(target))) {
+          return sendJson(res, { error: "Workspace unavailable through main" }, 403);
+        }
         const safeRoots = [os.homedir(), path.resolve(workspaceRoot), path.join(os.homedir(), "Documents")];
         const isUnderSafe = safeRoots.some((r) => target === r || target.startsWith(r + path.sep));
         if (!isUnderSafe) {
@@ -1077,9 +1239,10 @@ export async function runWindowApp({
         const showHidden = url.searchParams.get("hidden") === "1";
         let resolved;
         try {
-          let p = (requested || os.homedir()).trim();
+          let p = (requested || (remote ? remoteRoots[0] : os.homedir())).trim();
           if (p.startsWith("~/") || p === "~") p = path.join(os.homedir(), p.slice(1));
           resolved = path.resolve(p);
+          if (remote && !remoteWorkspaceAllowed(resolved)) return sendJson(res, { error: "Workspace unavailable through main" }, 403);
         } catch {
           return sendJson(res, { error: "Невалидный путь" }, 400);
         }
@@ -1087,8 +1250,8 @@ export async function runWindowApp({
           const listing = listBrowseDirectories(resolved, { showHidden });
           return sendJson(res, {
             ...listing,
-            home: os.homedir(),
-            defaultWorkspace: path.resolve(workspaceRoot),
+            home: remote ? remoteRoots[0] : os.homedir(),
+            defaultWorkspace: remote ? remoteRoots[0] : path.resolve(workspaceRoot),
           });
         } catch (error) {
           const code = error.code;
@@ -1106,6 +1269,7 @@ export async function runWindowApp({
         const projects = [];
         for (const c of state.conversations) {
           const w = String(c.workspace || workspaceRoot);
+          if (remote && !remoteWorkspaceAllowed(w)) continue;
           if (seen.has(w)) continue;
           seen.add(w);
           projects.push({
@@ -1114,15 +1278,16 @@ export async function runWindowApp({
             exists: fs.existsSync(w),
           });
         }
-        if (!seen.has(workspaceRoot)) {
+        const defaultRoot = remote ? remoteRoots[0] : workspaceRoot;
+        if (!seen.has(defaultRoot)) {
           projects.unshift({
-            path: workspaceRoot,
-            name: path.basename(workspaceRoot) || workspaceRoot,
-            exists: fs.existsSync(workspaceRoot),
+            path: defaultRoot,
+            name: path.basename(defaultRoot) || defaultRoot,
+            exists: fs.existsSync(defaultRoot),
             isDefault: true,
           });
         }
-        return sendJson(res, { projects, defaultWorkspace: workspaceRoot, home: os.homedir() });
+        return sendJson(res, { projects, defaultWorkspace: defaultRoot, home: remote ? defaultRoot : os.homedir() });
       }
 
       if (req.method === "GET" && url.pathname === "/api/update/check") {
@@ -1144,7 +1309,7 @@ export async function runWindowApp({
         return sendJson(res, result);
       }
 
-      if (await handleMemoryRoute(req, url, res)) return;
+      if (await handleMemoryRoute(req, url, res, remote ? { workspaceAllowed: remoteWorkspaceAllowed } : {})) return;
       if (await handleSkillsRoute(req, url, res)) return;
       if (await handlePluginsRoute(req, url, res)) return;
 
@@ -1174,13 +1339,13 @@ export async function runWindowApp({
             autoSkillDefault: current.ui?.autoSkillDefault !== false,
             languages: Object.values(LANGUAGES).map((language) => getLanguageMeta(language.code)),
           },
-          telegram: current.telegram || { enabled: false, botToken: "", chatId: "" },
+          telegram: remote ? { enabled: current.telegram?.enabled === true, botToken: "", chatId: "" } : current.telegram || { enabled: false, botToken: "", chatId: "" },
           catalog,
           openAICompat: {
             embeddedBaseUrl: `http://127.0.0.1:${port}/v1`,
             anthropicBaseUrl: `http://127.0.0.1:${port}`,
             anthropicMessagesUrl: `http://127.0.0.1:${port}/v1/messages`,
-            apiKeys: current.openAICompat?.apiKeys || { deepseek: "", qwen: "" },
+            apiKeys: remote ? { deepseek: "", qwen: "" } : current.openAICompat?.apiKeys || { deepseek: "", qwen: "" },
             models: modelsList().data.map((m) => m.id),
             providers,
           },
@@ -1189,9 +1354,13 @@ export async function runWindowApp({
 
       if (req.method === "GET" && url.pathname === "/api/diagnostics") {
         return sendJson(res, await collectDiagnostics({
-          workspaceRoot,
-          state,
-          runningTaskIds: getRunningIds(),
+          workspaceRoot: remote ? remoteRoots[0] : workspaceRoot,
+          state: remote ? {
+            ...state,
+            conversations: state.conversations.filter((item) => remoteWorkspaceAllowed(item.workspace || workspaceRoot)),
+            activeConversationId: remoteWorkspaceAllowed(state.conversations.find((item) => item.id === state.activeConversationId)?.workspace || "") ? state.activeConversationId : "",
+          } : state,
+          runningTaskIds: remote ? getRunningIds().filter((id) => state.conversations.some((item) => item.id === id && remoteWorkspaceAllowed(item.workspace || workspaceRoot))) : getRunningIds(),
         }));
       }
 
@@ -1204,13 +1373,13 @@ export async function runWindowApp({
 
       if (req.method === "PUT" && url.pathname === "/api/settings") {
         const body = await readJsonBody(req);
-        const saved = saveSettings({
+        const saved = saveSettings(remote ? remoteSettingsInput(body) : {
           allowedCommands: body.allowedCommands,
           commandPermissions: body.commandPermissions,
           ui: body.ui,
           telegram: body.telegram,
         });
-        return sendJson(res, {
+        return sendJson(res, remote ? remoteSettingsResponse(saved) : {
           allowedCommands: saved.allowedCommands,
           commandPermissions: saved.commandPermissions,
           ui: saved.ui,
@@ -1223,11 +1392,12 @@ export async function runWindowApp({
       if (req.method === "POST" && url.pathname === "/api/conversations") {
         const body = await readJsonBody(req);
 
-        let workspace = String(body.workspace || workspaceRoot).trim() || workspaceRoot;
+        let workspace = String(body.workspace || (remote ? remoteRoots[0] : workspaceRoot)).trim() || (remote ? remoteRoots[0] : workspaceRoot);
         if (workspace.startsWith("~/") || workspace === "~") {
           workspace = path.join(os.homedir(), workspace.slice(1));
         }
         workspace = path.resolve(workspace);
+        if (remote && !remoteWorkspaceAllowed(workspace)) return sendJson(res, { error: "Workspace unavailable through main" }, 403);
 
         const exists = fs.existsSync(workspace);
         if (!exists) {
@@ -1329,17 +1499,7 @@ export async function runWindowApp({
         if (typeof body.roleId === "string") {
           conversation.roleId = normalizeRoleId(body.roleId);
         }
-        if (typeof body.pipelineMode === "boolean") {
-          conversation.pipelineMode = body.pipelineMode;
-        }
-        if (typeof body.coderMode === "boolean") {
-          conversation.coderMode = body.coderMode;
-          if (!body.coderMode) conversation.hardwareMode = false;
-        }
-        if (typeof body.hardwareMode === "boolean") {
-          conversation.hardwareMode = body.hardwareMode;
-          if (body.hardwareMode) conversation.coderMode = true;
-        }
+        applyAgentModePatch(conversation, body);
         if (typeof body.memoryEnabled === "boolean") {
           conversation.memoryEnabled = body.memoryEnabled;
         }
@@ -1479,6 +1639,12 @@ export async function runWindowApp({
         const conversation = state.conversations.find((item) => item.id === stopMatch[1]);
         if (!conversation) return sendJson(res, { error: "Conversation not found" }, 404);
         const stopped = stopTask(conversation.id);
+        if (stopped) {
+          for (const message of conversation.messages || []) {
+            if (message.agentRun?.status === "running") message.agentRun.status = "stopped";
+          }
+          saveWindowState(workspaceRoot, state);
+        }
         if (stopped) logConsole(`[stop] task stopped for ${conversation.id}`);
         return sendJson(res, { conversation, stopped, running: isRunning(conversation.id) });
       }
@@ -1506,7 +1672,7 @@ export async function runWindowApp({
           source: userMessageSource || "desktop",
           promptChars: prompt.length,
           imageCount: storedImages.length,
-          pipeline: body.pipeline === true || conversation.pipelineMode === true,
+          pipeline: shouldRunPipeline(conversation, body, prompt),
           coderMode: body.coderMode === true || conversation.coderMode === true,
           searchEnabled: body.searchEnabled === true,
         });
@@ -1520,7 +1686,7 @@ export async function runWindowApp({
         });
         conversation.pendingQuestion = null;
 
-        if (body.pipeline === true || conversation.pipelineMode === true) {
+        if (shouldRunPipeline(conversation, body, prompt)) {
           if (isRunning(conversation.id)) {
             conversation.messages.push({
               role: "assistant",
@@ -1542,7 +1708,7 @@ export async function runWindowApp({
           state.activeConversationId = conversation.id;
           saveWindowState(workspaceRoot, state);
           startTask(conversation.id, "pipeline", async (signal) => {
-            await runPipelineFromConversation(conversation.id, prompt, body, signal);
+            await runPipelineFromConversation(conversation.id, prompt, body, signal, remote ? remoteWorkspaceAllowed : null);
           }, "Pipeline");
           return sendJson(res, { conversation, running: true });
         }
@@ -1561,16 +1727,6 @@ export async function runWindowApp({
 
           // Lazy-init Qwen-клиента — создаём один раз за life сервера.
           try {
-            let qwenClient = await getOrCreateQwenClient();
-            // Lazy createChat: на первом сообщении. Модель — из чата.
-            if (!conversation.sessionId) {
-              conversation.sessionId = await qwenApiCall((c) =>
-                c.createChat({ model: conversation.model || undefined }),
-              );
-              saveWindowState(workspaceRoot, state);
-              qwenClient = await getOrCreateQwenClient();
-            }
-
             // /code-режим или Coder-mode (per-chat toggle) → запускаем code-agent.
             // ASYNC: задача идёт в фоне через task-runner. Возвращаем conversation
             // сразу с running:true, UI делает polling до завершения.
@@ -1603,8 +1759,12 @@ export async function runWindowApp({
               const progressMessage = createCodeProgressMessage(task, { browserOnly: agentInput.browserOnly });
               conversation.messages.push(progressMessage);
               const adapter = createQwenAgentAdapter({
-                complete: (opts) =>
-                  qwenApiCall((c) => c.complete(opts), {
+                complete: async (opts) => {
+                  if (!conversation.sessionId) {
+                    conversation.sessionId = await qwenApiCall((c) => c.createChat({ model: conversation.model || undefined }));
+                    saveWindowState(workspaceRoot, state);
+                  }
+                  return qwenApiCall((c) => c.complete({ ...opts, chatId: opts.chatId || conversation.sessionId }), {
                     onRelogin: () => {
                       progressMessage.content = [
                         QWEN_RELOGIN_IN_PROGRESS_MESSAGE,
@@ -1615,7 +1775,8 @@ export async function runWindowApp({
                       conversation.updatedAt = progressMessage.updatedAt;
                       saveWindowState(workspaceRoot, state);
                     },
-                  }),
+                  });
+                },
               });
               const workspacePath = path.resolve(conversation.workspace || workspaceRoot);
               await prepareBrowserAgentTask(task);
@@ -1632,6 +1793,7 @@ export async function runWindowApp({
                 model: conversation.model || undefined,
               };
               const parentId = getCodeParentMessageId(conversation);
+              markAgentRun(conversation, progressMessage, task, baseOptions, parentId, agentInput, body);
               conversation.updatedAt = new Date().toISOString();
               saveWindowState(workspaceRoot, state);
 
@@ -1647,6 +1809,7 @@ export async function runWindowApp({
                   logConsole(`[code] qwen started: ${summarizeForLog(task)}`);
                   const codeResult = await runAgentTask(adapter, baseOptions, workspacePath, task, parentId, {
                     signal,
+                    ...persistentAgentOptions(conversation, progressMessage, adapter),
                     ...buildAgentTaskOptions(conversation, body, {
                       hardwareMode,
                       systemPrompt: hardwareMode ? createHardwareAgentPrompt() : "",
@@ -1674,12 +1837,17 @@ export async function runWindowApp({
                   conversation.lastAgentMeta = finalized.agentMeta;
                   progressMessage.content = finalized.content.trimEnd();
                   delete progressMessage.streaming;
+                  delete progressMessage.agentRun;
                   progressMessage.updatedAt = new Date().toISOString();
                   if (toolText) logConsoleBlock("code tools", toolText);
                   logConsoleBlock("assistant", codeResult.message);
                   logConsole(`[code] qwen completed: ${codeResult.toolLogs.length} tool log(s)`);
                 } catch (err) {
-                  progressMessage.content = `⚠️ /code error: ${err.message}`;
+                  progressMessage.content = signal.aborted ? "⏹ Остановлено пользователем." : `⚠️ /code приостановлен: ${err.message}`;
+                  if (progressMessage.agentRun) {
+                    progressMessage.agentRun.status = signal.aborted ? "stopped" : "paused";
+                    progressMessage.agentRun.pauseReason = signal.aborted ? null : agentPauseReason(err);
+                  }
                   delete progressMessage.streaming;
                   progressMessage.updatedAt = new Date().toISOString();
                   logConsole(`[code] qwen failed: ${err.message}`);
@@ -1689,6 +1857,16 @@ export async function runWindowApp({
               }, "Qwen /code");
 
               return sendJson(res, { conversation, running: true });
+            }
+
+            let qwenClient = await getOrCreateQwenClient();
+            // Interactive chat keeps its existing eager session creation.
+            if (!conversation.sessionId) {
+              conversation.sessionId = await qwenApiCall((c) =>
+                c.createChat({ model: conversation.model || undefined }),
+              );
+              saveWindowState(workspaceRoot, state);
+              qwenClient = await getOrCreateQwenClient();
             }
 
             const isQwenReasoning = findProviderModel("qwen", conversation.model)?.reasoning === true;
@@ -1875,6 +2053,7 @@ export async function runWindowApp({
               const progressLogs = [];
               const progressMessage = createCodeProgressMessage(task, { browserOnly: agentInput.browserOnly });
               conversation.messages.push(progressMessage);
+              markAgentRun(conversation, progressMessage, task, baseOptions, parentId, agentInput, body);
               conversation.updatedAt = new Date().toISOString();
               saveWindowState(workspaceRoot, state);
 
@@ -1890,6 +2069,7 @@ export async function runWindowApp({
                   logConsole(`[code] chatgpt started: ${summarizeForLog(task)}`);
                   const codeResult = await runAgentTask(adapter, baseOptions, workspacePath, task, parentId, {
                     signal,
+                    ...persistentAgentOptions(conversation, progressMessage, adapter),
                     ...buildAgentTaskOptions(conversation, body, {
                       hardwareMode,
                       systemPrompt: hardwareMode ? createHardwareAgentPrompt() : "",
@@ -1918,12 +2098,17 @@ export async function runWindowApp({
                   conversation.lastAgentMeta = finalized.agentMeta;
                   progressMessage.content = finalized.content.trimEnd();
                   delete progressMessage.streaming;
+                  delete progressMessage.agentRun;
                   progressMessage.updatedAt = new Date().toISOString();
                   if (toolText) logConsoleBlock("code tools", toolText);
                   logConsoleBlock("assistant", codeResult.message);
                   logConsole(`[code] chatgpt completed: ${codeResult.toolLogs.length} tool log(s)`);
                 } catch (err) {
-                  progressMessage.content = `⚠️ /code error: ${err.message}`;
+                  progressMessage.content = signal.aborted ? "⏹ Остановлено пользователем." : `⚠️ /code приостановлен: ${err.message}`;
+                  if (progressMessage.agentRun) {
+                    progressMessage.agentRun.status = signal.aborted ? "stopped" : "paused";
+                    progressMessage.agentRun.pauseReason = signal.aborted ? null : agentPauseReason(err);
+                  }
                   delete progressMessage.streaming;
                   progressMessage.updatedAt = new Date().toISOString();
                   logConsole(`[code] chatgpt failed: ${err.message}`);
@@ -2158,6 +2343,7 @@ export async function runWindowApp({
           const progressLogs = [];
           const progressMessage = createCodeProgressMessage(task, { browserOnly: agentInput.browserOnly });
           conversation.messages.push(progressMessage);
+          markAgentRun(conversation, progressMessage, task, baseOptions, parentId, agentInput, body);
           conversation.updatedAt = new Date().toISOString();
           saveWindowState(workspaceRoot, state);
 
@@ -2173,6 +2359,7 @@ export async function runWindowApp({
               logConsole(`[code] deepseek started: ${summarizeForLog(task)}`);
               const codeResult = await runAgentTask(client, baseOptions, workspacePath, task, parentId, {
                 signal,
+                ...persistentAgentOptions(conversation, progressMessage, client),
                 ...buildAgentTaskOptions(conversation, body, {
                   hardwareMode: dsHardwareMode,
                   systemPrompt: dsHardwareMode ? createHardwareAgentPrompt() : "",
@@ -2200,12 +2387,17 @@ export async function runWindowApp({
               conversation.lastAgentMeta = finalized.agentMeta;
               progressMessage.content = finalized.content.trimEnd();
               delete progressMessage.streaming;
+              delete progressMessage.agentRun;
               progressMessage.updatedAt = new Date().toISOString();
               if (toolText) logConsoleBlock("code tools", toolText);
               logConsoleBlock("assistant", codeResult.message);
               logConsole(`[code] deepseek completed: ${codeResult.toolLogs.length} tool log(s)`);
             } catch (err) {
-              progressMessage.content = `⚠️ /code error: ${err.message}`;
+              progressMessage.content = signal.aborted ? "⏹ Остановлено пользователем." : `⚠️ /code приостановлен: ${err.message}`;
+              if (progressMessage.agentRun) {
+                progressMessage.agentRun.status = signal.aborted ? "stopped" : "paused";
+                progressMessage.agentRun.pauseReason = signal.aborted ? null : agentPauseReason(err);
+              }
               delete progressMessage.streaming;
               progressMessage.updatedAt = new Date().toISOString();
               logConsole(`[code] deepseek failed: ${err.message}`);
@@ -2317,6 +2509,20 @@ export async function runWindowApp({
 
   const url = `http://127.0.0.1:${port}`;
   appLogger.info("server.started", { url, workspaceRoot, port });
+  const resumableRuns = recoverableAgentRuns(state.conversations);
+  if (resumableRuns.length || state.conversations.some((conversation) =>
+    conversation.messages?.some((message) => message.agentRun?.status === "needs_review"))) {
+    saveWindowState(workspaceRoot, state);
+  }
+  for (const [conversation, progressMessage] of resumableRuns) {
+    setImmediate(() => resumeAgentRun(conversation, progressMessage).catch((error) => {
+      progressMessage.agentRun.status = "paused";
+      progressMessage.agentRun.pauseReason = agentPauseReason(error);
+      progressMessage.content = `⚠️ /code приостановлен: ${error.message}`;
+      delete progressMessage.streaming;
+      saveWindowState(workspaceRoot, state);
+    }));
+  }
   const startupConversation = state.conversations.find((item) => item.id === state.activeConversationId);
   if (startupConversation?.provider === "qwen") {
     setImmediate(() => {

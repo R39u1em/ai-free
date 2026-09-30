@@ -140,6 +140,12 @@ export function renderEmbedAppBrowserLiveHtml() {
     .btn:hover { border-color: var(--accent); background: #222a36; }
     .btn:active { transform: translateY(1px); }
     .navBtn { width: 30px; height: 28px; padding: 0; font-size: 15px; }
+    @media (max-width: 540px) {
+      .bar { gap: 4px; padding: 6px; }
+      .bar span.label { display: none; }
+      .navBtn { width: 26px; flex: 0 0 26px; }
+      .bar .btn:not(.navBtn) { padding-inline: 6px; }
+    }
     .viewport {
       position: relative;
       min-height: 0;
@@ -177,7 +183,7 @@ export function renderEmbedAppBrowserLiveHtml() {
   <div class="viewport" id="viewport">
     <div class="screen" id="screen">
       <div id="placeholder">Запуск браузера…</div>
-      <img id="live" src="/api/browser/live-stream" alt="Web live" decoding="async">
+      <img id="live" alt="Web live" decoding="async">
       <div id="clickLayer"></div>
     </div>
     <div class="hint" id="hint">URL в строке выше или в чате: «найди новости Мурманска»</div>
@@ -251,7 +257,12 @@ export function renderEmbedAppBrowserLiveHtml() {
       placeholder?.classList.add("hidden");
     }
 
+    let streamRetryTimer = null;
+    let streamFailures = 0;
+
     function restartStream() {
+      if (streamRetryTimer) clearTimeout(streamRetryTimer);
+      streamRetryTimer = null;
       streamNonce = Date.now();
       live.classList.remove("ready");
       if (placeholder) {
@@ -259,28 +270,41 @@ export function renderEmbedAppBrowserLiveHtml() {
         placeholder.textContent = "Подключение к стриму…";
       }
       live.src = "/api/browser/live-stream?t=" + streamNonce;
-      setTimeout(hidePlaceholder, 1500);
+    }
+
+    function scheduleStreamRetry() {
+      if (streamRetryTimer) return;
+      streamFailures += 1;
+      const delayMs = Math.min(1000 * (2 ** Math.min(streamFailures - 1, 4)), 10000);
+      if (placeholder) {
+        placeholder.classList.remove("hidden");
+        placeholder.textContent = "Восстанавливаю браузерный стрим…";
+      }
+      streamRetryTimer = setTimeout(restartStream, delayMs);
     }
 
     live.addEventListener("load", () => {
+      streamFailures = 0;
+      if (streamRetryTimer) clearTimeout(streamRetryTimer);
+      streamRetryTimer = null;
       live.classList.add("ready");
       hidePlaceholder();
     });
     live.addEventListener("error", () => {
       live.classList.remove("ready");
-      if (placeholder) {
-        placeholder.classList.remove("hidden");
-        placeholder.textContent = "Стрим недоступен. Нажмите ↻ или «Сброс».";
-      }
+      scheduleStreamRetry();
     });
 
     fetch("/api/browser/warm", { method: "POST" })
-      .then((r) => r.json().catch(() => ({})))
+      .then((r) => {
+        if (!r.ok) throw new Error("Browser warm-up failed");
+        return r.json().catch(() => ({}));
+      })
       .then((data) => {
         if (data.url && urlInput && !urlInput.value) urlInput.placeholder = data.url.startsWith("data:") ? "https://yandex.ru" : data.url;
-        setTimeout(hidePlaceholder, 500);
+        restartStream();
       })
-      .catch(() => {});
+      .catch(scheduleStreamRetry);
 
     async function navigateTo(input) {
       let url = String(input || "").trim();

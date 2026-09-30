@@ -179,6 +179,7 @@ export const STYLES = `
       min-height: 0;
       overflow: hidden;
     }
+    .mobileChatsBtn, .mobileCloseChats { display: none; }
     .sidebarMenu {
       display: flex;
       gap: 4px;
@@ -2078,6 +2079,22 @@ export const STYLES = `
     }
 
     @media (max-width: 640px) {
+      .app { grid-template-columns: minmax(0, 1fr); }
+      .app > .main { grid-column: 1; grid-row: 1; }
+      .sidebarResizer { display: none; }
+      .sidebar {
+        position: fixed;
+        z-index: 100;
+        top: 0;
+        left: 0;
+        width: min(320px, 86vw);
+        transform: translateX(-105%);
+        transition: transform 0.18s ease;
+        box-shadow: var(--drawer-shadow);
+      }
+      body.mobileSidebarOpen .sidebar { transform: translateX(0); }
+      .mobileChatsBtn, .mobileCloseChats { display: inline-flex; align-items: center; justify-content: center; }
+      .titleRow.topbarTitle { flex-direction: row; align-items: center; }
       .topbar {
         padding: 7px 9px;
       }

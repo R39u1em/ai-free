@@ -1,5 +1,9 @@
 // Общий браузер приложения: Web (для DeepSeek/Qwen) + ChatGPT (закреплён) + файлы workspace.
 
+export function preferredBrowserTab(provider) {
+  return provider === "deepseek" || provider === "qwen" ? "web" : "chatgpt";
+}
+
 export function renderEmbedBrowserHtml({ root = "", defaultTab = "chatgpt" } = {}) {
   const safeRoot = JSON.stringify(String(root || ""));
   const safeDefault = JSON.stringify(defaultTab === "files" ? "files" : (defaultTab === "web" ? "web" : "chatgpt"));

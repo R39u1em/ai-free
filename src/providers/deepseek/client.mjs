@@ -6,6 +6,7 @@ import { BASE_URL, COMPLETION_PATH, DEFAULT_AUTH_FILE } from "../../config.mjs";
 import { baseHeaders } from "./headers.mjs";
 import { solvePow } from "./pow.mjs";
 import { streamSse } from "./sse.mjs";
+import { withProviderAccountSlot } from "../account-slot.mjs";
 import { createFileLogger } from "../../logging/logger.mjs";
 
 const providerLogger = createFileLogger({ component: "provider.deepseek" });
@@ -448,7 +449,7 @@ export class DeepSeekChatClient {
       searchEnabled: args?.searchEnabled === true,
     });
     try {
-      const result = await this._withReauth(() => this._completeWithInvalidMessageRetry(args, refFileIds));
+      const result = await withProviderAccountSlot("deepseek", () => this._withReauth(() => this._completeWithInvalidMessageRetry(args, refFileIds)));
       providerLogger.info("provider.deepseek.success", {
         operation: "completion",
         model: args?.modelType || null,

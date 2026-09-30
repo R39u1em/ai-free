@@ -10,6 +10,7 @@
 // формат SSE-событий) могут потребовать корректировки после первой попытки.
 
 import { randomUUID } from "node:crypto";
+import { withProviderAccountSlot } from "../account-slot.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -262,10 +263,10 @@ export class QwenChatClient {
       autoRetry,
     });
     try {
-      const result = await this.#completeWithRecovery({
+      const result = await withProviderAccountSlot("qwen", () => this.#completeWithRecovery({
         chatId, prompt, parentId, thinking, search, onText, onThinking, model,
         allowNewChatRecovery, autoRetry,
-      });
+      }));
       providerLogger.info("provider.qwen.success", {
         operation: "completion",
         model,

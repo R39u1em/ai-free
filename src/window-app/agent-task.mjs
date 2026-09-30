@@ -1,6 +1,7 @@
 // Хелперы для запуска code-agent из window-app server.
 
-import { resolveAgentTaskInput } from "../code-agent/task-input.mjs";
+import { parseAgentTaskPrompt, resolveAgentTaskInput } from "../code-agent/task-input.mjs";
+import { shouldAutoRunBrowserTask } from "./browser-snapshot.mjs";
 
 export const AGENT_TASK_EMPTY_HELP =
   "Напиши задачу после /code или /skill <id>. Примеры:\n" +
@@ -9,6 +10,37 @@ export const AGENT_TASK_EMPTY_HELP =
   "• /skill code-review проверь src/code-agent/";
 
 const PERSISTENT_CODE_CONTEXT_PROVIDERS = new Set(["chatgpt", "qwen", "deepseek"]);
+
+export function applyAgentModePatch(conversation, body) {
+  if (typeof body.pipelineMode === "boolean") {
+    conversation.pipelineMode = body.pipelineMode;
+    if (body.pipelineMode) {
+      conversation.coderMode = false;
+      conversation.hardwareMode = false;
+    }
+  }
+  if (typeof body.coderMode === "boolean") {
+    conversation.coderMode = body.coderMode;
+    if (body.coderMode) conversation.pipelineMode = false;
+    else conversation.hardwareMode = false;
+  }
+  if (typeof body.hardwareMode === "boolean") {
+    conversation.hardwareMode = body.hardwareMode;
+    if (body.hardwareMode) {
+      conversation.coderMode = true;
+      conversation.pipelineMode = false;
+    }
+  }
+}
+
+export function shouldRunPipeline(conversation, body, prompt) {
+  if (body.pipeline === true) return true;
+  return conversation.pipelineMode === true
+    && conversation.coderMode !== true
+    && conversation.hardwareMode !== true
+    && !parseAgentTaskPrompt(prompt)
+    && !shouldAutoRunBrowserTask(prompt);
+}
 
 export function resolveConversationAgentTask(prompt, conversation, {
   autoCodeMode = false,

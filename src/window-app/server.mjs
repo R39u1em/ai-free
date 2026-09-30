@@ -836,7 +836,7 @@ export async function runWindowApp({
       // http://127.0.0.1:<window-port>/v1/...
       if (url.pathname.startsWith("/v1/")) {
         logConsole(`[api] ${req.method} ${url.pathname}`);
-        setOpenAICorsHeaders(res);
+        setOpenAICorsHeaders(res, String(req.headers.origin || ""));
         if (req.method === "OPTIONS") {
           res.statusCode = 204;
           return res.end();

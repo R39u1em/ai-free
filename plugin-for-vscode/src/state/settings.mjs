@@ -424,7 +424,13 @@ export function ensureOpenAICompatApiKey(provider) {
 export function resolveOpenAICompatApiKey(req) {
   const keys = loadSettings().openAICompat?.apiKeys || {};
   const configured = Object.entries(keys).filter(([, key]) => key);
-  if (!configured.length) return { ok: true, provider: null };
+  if (!configured.length) {
+    // Раньше при пустом списке ключей сервер пропускал ВСЕ запросы — «защита по
+    // умолчанию выключена». Теперь open-mode возможен только явно, через env.
+    return process.env.API_ALLOW_NO_AUTH === "1"
+      ? { ok: true, provider: null }
+      : { ok: false, provider: null };
+  }
 
   const auth = String(req.headers.authorization || "");
   const bearer = auth.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();

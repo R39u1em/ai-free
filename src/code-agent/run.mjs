@@ -271,6 +271,11 @@ export async function runCodeTask(
         return finish({ parentMessageId: parent, message, toolLogs });
       }
 
+      // Анти-бан: перед следующим запросом к провайдеру выдерживаем случайную
+      // «человеческую» паузу (имитация чтения результата и набора текста).
+      // Выключается через AI_FREE_HUMAN_DELAY_MS=0.
+      await humanStepDelay();
+
       const clarifications = takeInterrupts(options);
       const clarificationText = clarifications.length
         ? `\n\n${buildClarificationPrompt(clarifications)}`
@@ -365,6 +370,40 @@ export function resolveNoToolTextRetries(value) {
 
 export function isTransientUpstreamTextError(text) {
   return /allocated quota exceeded|quota\/token-limit|token-limit|too many requests|rate limit/i.test(String(text || ""));
+}
+
+// Human-like пауза между шагами tool-loop (анти-бан). Вызывается ПОСЛЕ того,
+// как ответ чата сгенерирован полностью и обработан, ПЕРЕД отправкой следующего
+// промпта — так интервал между запросами к провайдеру получается случайным.
+// Диапазон: min..max, по умолчанию 5000–15000 мс (DeepSeek банит за быстрые
+// серии запросов). AI_FREE_HUMAN_DELAY_MS=0 полностью выключает паузы.
+export const HUMAN_DELAY_DEFAULT_MIN_MS = 5_000;
+export const HUMAN_DELAY_DEFAULT_MAX_MS = 15_000;
+
+export function resolveHumanDelayRangeMs(env = process.env) {
+  const parseRaw = (value, fallback) => {
+    if (value === undefined || value === null || String(value).trim() === "") return fallback;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return parsed;
+  };
+  const min = parseRaw(env.AI_FREE_HUMAN_DELAY_MS, HUMAN_DELAY_DEFAULT_MIN_MS);
+  if (min <= 0) return { min: 0, max: 0 }; // 0 или меньше = паузы выключены
+  const clampedMin = Math.min(Math.floor(min), 60_000);
+  const rawMax = parseRaw(env.AI_FREE_HUMAN_DELAY_MAX_MS, HUMAN_DELAY_DEFAULT_MAX_MS);
+  const clampedMax = Math.max(clampedMin, Math.min(Math.floor(rawMax), 120_000));
+  return { min: clampedMin, max: clampedMax };
+}
+
+// Обратная совместимость: старый экспорт возвращает нижнюю границу диапазона.
+export function resolveHumanDelayMs(env = process.env) {
+  return resolveHumanDelayRangeMs(env).min;
+}
+
+async function humanStepDelay() {
+  const { min, max } = resolveHumanDelayRangeMs();
+  if (min <= 0) return;
+  await sleep(min + Math.random() * (max - min));
 }
 
 function sleep(ms) {

@@ -3,6 +3,20 @@
 // Цель: собрать все дельты в финальную строку + знать lastAssistantMessageId
 // (для parent_message_id в следующем запросе цепочки).
 
+// Жёсткий таймаут «зависания» генерации: если от upstream не приходит ни одного
+// TCP-чанка дольше DSCLI_STREAM_IDLE_TIMEOUT_MS (по умолчанию 20 c), стрим
+// прерывается ошибкой ds_stream_idle_timeout — выше по стеку её перехватит
+// retry-логика (_withReauth / transient retries) и повторит запрос.
+export function resolveDeepSeekStreamIdleTimeoutMs(env = process.env) {
+  const raw = env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
+  // Пустая/отсутствующая переменная = дефолт; нечисловое значение = дефолт.
+  if (raw === undefined || raw === null || String(raw).trim() === "") return 20_000;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return 20_000;
+  if (parsed <= 0) return 0; // 0 или меньше = watchdog выключен
+  return Math.min(Math.floor(parsed), 600_000);
+}
+
 export async function streamSse(res, debug, onText = null) {
   const decoder = new TextDecoder();
   const reader = res.body.getReader();
@@ -12,6 +26,7 @@ export async function streamSse(res, debug, onText = null) {
   const fragments = new Map();
   let eventCount = 0;
   const eventTypes = new Set();
+  const idleTimeoutMs = resolveDeepSeekStreamIdleTimeoutMs();
 
   const processEvent = (rawEvent) => {
     const event = parseSseEvent(rawEvent);
@@ -40,9 +55,44 @@ export async function streamSse(res, debug, onText = null) {
   };
 
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    let read;
+    if (idleTimeoutMs > 0) {
+      // reader.read() не отменяем через AbortController — оборачиваем гонкой
+      // с таймером. При таймауте закрываем поток, чтобы не оставить висякий TCP.
+      let timer = null;
+      try {
+        read = await Promise.race([
+          reader.read().then((r) => ({ kind: "chunk", r })),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("ds_stream_idle_timeout")),
+              idleTimeoutMs,
+            );
+          }),
+        ]);
+      } catch (error) {
+        if (String(error?.message || error) === "ds_stream_idle_timeout") {
+          try { await reader.cancel(); } catch {}
+          const wrapped = new Error(
+            `DeepSeek stream stalled: no chunks for ${Math.round(idleTimeoutMs / 1000)}s. ` +
+            (fullText ? `Partial text length=${fullText.length}.` : "No content received yet."),
+          );
+          wrapped.code = "STREAM_IDLE_TIMEOUT";
+          wrapped.isTransientStreamError = true;
+          throw wrapped;
+        }
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (read.kind !== "chunk") break;
+      if (read.r.done) break;
+      buffer += decoder.decode(read.r.value, { stream: true });
+    } else {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+    }
 
     let boundary;
     while ((boundary = buffer.match(/\r?\n\r?\n/))) {

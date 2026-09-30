@@ -23,7 +23,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadDotEnv } from "../src/args.mjs";
-import { resolveOpenAICompatApiKey } from "../src/state/settings.mjs";
+import { resolveOpenAICompatApiKey, loadSettings } from "../src/state/settings.mjs";
 import { createFileLogger } from "../src/logging/logger.mjs";
 
 loadDotEnv();
@@ -53,7 +53,7 @@ export function createOpenAICompatServer() {
     });
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     // CORS — на всякий случай, для веб-клиентов на localhost.
-    setOpenAICorsHeaders(res);
+    setOpenAICorsHeaders(res, String(req.headers.origin || ""));
     if (req.method === "OPTIONS") {
       res.statusCode = 204;
       return res.end();
@@ -86,8 +86,17 @@ export function createOpenAICompatServer() {
   });
 }
 
-export function setOpenAICorsHeaders(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+export function setOpenAICorsHeaders(res, origin = "") {
+  // CORS: вместо "*" — whitelist localhost/127.0.0.1 (защита от DNS-rebinding и
+  // запросов из произвольных веб-страниц). Для curl/SDK без Origin ничего не ставим.
+  if (origin) {
+    let host = "";
+    try { host = new URL(origin).hostname; } catch {}
+    if (host === "localhost" || host.endsWith(".localhost") || host === "127.0.0.1" || host === "[::1]" || host === "::1") {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+    }
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, x-api-key, Anthropic-Version, Anthropic-Beta");
 }
@@ -100,6 +109,16 @@ export function startOpenAICompatServer({
   server.listen(port, host, () => {
     apiLogger.info("api.server.started", { host, port });
     console.log(`OpenAI-compat API: http://${host}:${port}`);
+    // Auth-подсказка: раньше при отсутствии ключей сервер молча пускал всех без
+    // авторизации; теперь open-mode только с API_ALLOW_NO_AUTH=1.
+    try {
+      const keys = Object.entries(loadSettings().openAICompat?.apiKeys || {}).filter(([, k]) => k);
+      if (!keys.length && process.env.API_ALLOW_NO_AUTH !== "1") {
+        console.log("⚠️  API-ключи не заданы — все /v1 запросы вернут 401.");
+        console.log("    Создайте ключ в Settings (или вызовите ensureOpenAICompatApiKey),");
+        console.log("    либо явно разрешите локальный режим без авторизации: API_ALLOW_NO_AUTH=1.");
+      }
+    } catch {}
     console.log(`Models:    GET  http://${host}:${port}/v1/models`);
     console.log(`Chat:      POST http://${host}:${port}/v1/chat/completions`);
     console.log(`Responses: POST http://${host}:${port}/v1/responses`);

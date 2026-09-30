@@ -262,13 +262,14 @@ async function readSessionFromPage(page) {
 }
 
 export function isSuccessfulChatGPTSession(body) {
-  return Boolean(
-    body
-    && typeof body === "object"
-    && body.user
-    && !body.error
-    && (body.accessToken || body.sessionToken),
-  );
+  if (!body || typeof body !== "object" || !body.user || body.error) return false;
+  // Auth.js (chatgpt.com) в /api/auth/session возвращает только {user, expires} —
+  // accessToken там отсутствует даже при успешном логине. Прежняя проверка
+  // ждала accessToken ИЛИ sessionToken в теле и никогда не срабатывала, из-за
+  // чего логин «висел» до 10-минутного таймаута даже после успешного входа.
+  // Теперь: если тело содержит хотя бы user без ошибки — это залогиненная
+  // сессия; наличие токенов проверяется отдельно на месте вызова.
+  return true;
 }
 
 async function isChatGPTChallengePage(page) {

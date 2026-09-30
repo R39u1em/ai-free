@@ -179,10 +179,23 @@ export async function loginQwenAndSave(authFile = QWEN_AUTH_FILE, { clearSession
 
   let captured;
   try {
-    captured = await waitForQwenToken(context, { previousToken });
+    // page передаём для «второго сигнала»: чат-UI Qwen после успешного входа
+    // скрывает кнопку Sign in и показывает composer. Если антибот задерживает
+    // cookie "token", но сессия в localStorage уже живая — тоже забираем её
+    // через context.cookies() и пропускаем JWT-валидацию (см. inside waitForQwenToken).
+    captured = await waitForQwenToken(context, { previousToken, page });
   } catch (error) {
     await context.close().catch(() => {});
     throw error;
+  }
+
+  if (!captured.token) {
+    await context.close().catch(() => {});
+    throw new Error(
+      "Qwen: вход определён по UI, но JWT-токен так и не появился. Это антибот Alibaba:\n" +
+      "залогинься в обычном Chrome → экспортируй cookies расширением в JSON →\n" +
+      "npm run import-qwen <файл.json>.",
+    );
   }
 
   await page.evaluate((token) => {
@@ -212,11 +225,43 @@ export async function loginQwenAndSave(authFile = QWEN_AUTH_FILE, { clearSession
 // previousToken — при re-login не принимаем тот же JWT, что был до сброса сессии.
 async function waitForQwenToken(
   context,
-  { timeoutMs = 5 * 60 * 1000, intervalMs = 1000, previousToken = "" } = {},
+  { timeoutMs = 5 * 60 * 1000, intervalMs = 1000, previousToken = "", page = null } = {},
 ) {
   const startedAt = Date.now();
   let lastSeen = "";
   let staleTokenLogged = false;
+  // Антизависание: если куки НЕ меняются столько времени — пользователь, скорее
+  // всего, уже закончил ввод (или окно открылось на готовой авторизации), но
+  // токен так и не появился. Даём подсказку вместо «вечного» ожидания.
+  const NO_PROGRESS_HINT_MS = 90_000;
+  let hintLogged = false;
+
+  // Второй сигнал логина: UI чата + живой токен в localStorage. Нужен, когда
+  // антибот задерживает cookie "token", но фронт сессию уже получил.
+  let uiProbeFails = 0;
+  const detectLoginByUi = async () => {
+    if (!page || uiProbeFails >= 3) return null;
+    try {
+      const state = await page.evaluate(() => {
+        const lsToken = (() => { try { return localStorage.getItem("token") || ""; } catch { return ""; } })();
+        const text = (document.body?.innerText || "").toLowerCase();
+        const signedInSignal = Boolean(
+          document.querySelector('textarea, [contenteditable="true"]')
+          && !/sign in|log in|войти|регистрация/.test(text.slice(0, 2000)),
+        );
+        return { lsToken, signedInSignal };
+      });
+      if (state.signedInSignal && state.lsToken && state.lsToken !== previousToken) {
+        const cookies = await context.cookies(QWEN_BASE_URL);
+        return { cookies, token: state.lsToken, userId: "" };
+      }
+      return null;
+    } catch {
+      uiProbeFails += 1;
+      return null;
+    }
+  };
+
   while (Date.now() - startedAt < timeoutMs) {
     let cookies;
     try {
@@ -244,15 +289,38 @@ async function waitForQwenToken(
       }
     }
 
+    // Fallback по UI, только когда основной сигнал давно не появляется.
+    if (page && Date.now() - startedAt > NO_PROGRESS_HINT_MS) {
+      const byUi = await detectLoginByUi();
+      if (byUi) {
+        console.log("[qwen-login] Токен взят из localStorage (UI-сигнал входа). Сохраняю сессию…");
+        return byUi;
+      }
+    }
+
     if (token && token !== lastSeen) {
       lastSeen = token;
+      hintLogged = false;
       console.log(`[qwen-login] token cookie found (${token.length} chars) — checking format...`);
+    }
+
+    if (!hintLogged && Date.now() - startedAt > NO_PROGRESS_HINT_MS) {
+      hintLogged = true;
+      console.log("[qwen-login] ⏳ Токен не появляется уже 90 секунд.");
+      console.log("[qwen-login]    Если вход выполнен, но окно не закрывается — антибот Qwen");
+      console.log("[qwen-login]    не выпустил cookie \"token\". Попробуй обновить страницу");
+      console.log("[qwen-login]    в окне браузера (F5). Если не поможет — используй обходной путь:");
+      console.log("[qwen-login]    залогинься в обычном Chrome → расширением экспортируй cookies");
+      console.log("[qwen-login]    в JSON → npm run import-qwen <файл.json>.");
     }
 
     await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error(
-    `Qwen login timeout (${Math.round(timeoutMs / 1000)}s). Не дождались валидного JWT в куках. Попробуй снова.`,
+    `Qwen login timeout (${Math.round(timeoutMs / 1000)}s). Не дождались валидного JWT в куках.\n` +
+    `Если вход в окне был успешным, но токен не появился — это антибот Alibaba:\n` +
+    `обнови страницу в окне или используй обходной путь: логин в обычном Chrome →\n` +
+    `экспорт cookies в JSON → npm run import-qwen <файл.json>.`,
   );
 }
 

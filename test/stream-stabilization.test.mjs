@@ -1,0 +1,118 @@
+// Тесты стабилизации стрима: idle-таймаут SSE (Задача 4) и human-like задержки (Задача 2).
+
+import { describe, it } from "node:test";
+import { strict as assert } from "node:assert";
+
+import { ReadableStream } from "node:stream/web";
+
+// До импорта модулей почистим env, чтобы дефолты читались детерминированно.
+delete process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
+delete process.env.AI_FREE_HUMAN_DELAY_MS;
+
+const { streamSse, resolveDeepSeekStreamIdleTimeoutMs } = await import("../src/providers/deepseek/sse.mjs");
+const { resolveHumanDelayMs, resolveHumanDelayRangeMs } = await import("../src/code-agent/run.mjs");
+delete process.env.AI_FREE_HUMAN_DELAY_MAX_MS;
+
+function stalledResponse(firstChunk, stallChunk) {
+  // Первый чанк отдаётся сразу; второй — только через 10 c (гарантированно
+  // позже watchdog на 3 c), поэтому тест не зависит от скорости CI-машины.
+  // Используем web-ReadableStream: у него есть getReader()/cancel(), как у
+  // реального res.body в fetch-ответе.
+  let timer = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(firstChunk));
+      timer = setTimeout(() => {
+        try { controller.enqueue(new TextEncoder().encode(stallChunk)); } catch {}
+      }, 10_000);
+    },
+  });
+  // Держим ссылку на reader: после cancel() стрим «заблокирован» им, и
+  // повторный cancel() в cleanup вернул бы unhandled rejection.
+  const reader = stream.getReader();
+  return {
+    response: { body: { getReader: () => reader } },
+    cleanup: () => {
+      clearTimeout(timer);
+      try { reader.cancel().catch(() => {}); } catch {}
+    },
+  };
+}
+
+describe("resolveDeepSeekStreamIdleTimeoutMs", () => {
+  it("defaults to 20s", () => {
+    assert.equal(resolveDeepSeekStreamIdleTimeoutMs({}), 20_000);
+  });
+
+  it("0 disables the watchdog", () => {
+    assert.equal(resolveDeepSeekStreamIdleTimeoutMs({ DSCLI_STREAM_IDLE_TIMEOUT_MS: "0" }), 0);
+  });
+
+  it("parses custom values and clamps them", () => {
+    assert.equal(resolveDeepSeekStreamIdleTimeoutMs({ DSCLI_STREAM_IDLE_TIMEOUT_MS: "5000" }), 5_000);
+    assert.equal(resolveDeepSeekStreamIdleTimeoutMs({ DSCLI_STREAM_IDLE_TIMEOUT_MS: "999999999" }), 600_000);
+    assert.equal(resolveDeepSeekStreamIdleTimeoutMs({ DSCLI_STREAM_IDLE_TIMEOUT_MS: "abc" }), 20_000);
+  });
+});
+
+describe("streamSse idle timeout", () => {
+  it("aborts a stalled stream with STREAM_IDLE_TIMEOUT", async () => {
+    process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS = "300";
+    const { response, cleanup } = stalledResponse(
+      'data: {"v":"hello"}\n\n',
+      'data: {"v":"never"}\n\n',
+    );
+    try {
+      await assert.rejects(
+        () => streamSse(response, false),
+        (error) => {
+          assert.match(error.message, /stalled/i);
+          assert.equal(error.code, "STREAM_IDLE_TIMEOUT");
+          assert.equal(error.isTransientStreamError, true);
+          return true;
+        },
+      );
+    } finally {
+      delete process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
+      cleanup();
+    }
+  });
+
+  it("reads a healthy stream fully when watchdog is on", async () => {
+    process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS = "20000";
+    try {
+      const result = await streamSse(new Response('data: {"v":"Hello "}\n\ndata: {"v":"world"}\n\n'), false);
+      assert.equal(result.text, "Hello world");
+    } finally {
+      delete process.env.DSCLI_STREAM_IDLE_TIMEOUT_MS;
+    }
+  });
+});
+
+describe("resolveHumanDelayMs / resolveHumanDelayRangeMs", () => {
+  it("defaults to 5000–15000ms range (anti-ban for DeepSeek)", () => {
+    assert.equal(resolveHumanDelayMs({}), 5_000);
+    assert.deepEqual(resolveHumanDelayRangeMs({}), { min: 5_000, max: 15_000 });
+  });
+
+  it("0 or negative disables anti-ban pauses", () => {
+    assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "0" }), 0);
+    assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "-5" }), 0);
+    assert.deepEqual(resolveHumanDelayRangeMs({ AI_FREE_HUMAN_DELAY_MS: "0" }), { min: 0, max: 0 });
+  });
+
+  it("honors explicit max env override", () => {
+    assert.deepEqual(
+      resolveHumanDelayRangeMs({ AI_FREE_HUMAN_DELAY_MS: "8000", AI_FREE_HUMAN_DELAY_MAX_MS: "20000" }),
+      { min: 8_000, max: 20_000 },
+    );
+  });
+
+  it("clamps absurd values", () => {
+    assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "120000" }), 60_000);
+    assert.equal(resolveHumanDelayMs({ AI_FREE_HUMAN_DELAY_MS: "not-a-number" }), 5_000);
+    // max никогда не бывает меньше min
+    const r = resolveHumanDelayRangeMs({ AI_FREE_HUMAN_DELAY_MS: "10000", AI_FREE_HUMAN_DELAY_MAX_MS: "2000" });
+    assert.equal(r.max, r.min);
+  });
+});

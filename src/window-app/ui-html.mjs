@@ -1999,6 +1999,7 @@ export function renderWindowHtml({ language: requestedLanguage = "", ui = {} } =
       const ws = workspaceRoot || appState.workspaceRoot || "";
       const q = new URLSearchParams();
       if (ws) q.set("root", ws);
+      if (activeConversation?.provider) q.set("provider", activeConversation.provider);
       return "/embed/browser?" + q.toString();
     }
 
@@ -2040,6 +2041,7 @@ export function renderWindowHtml({ language: requestedLanguage = "", ui = {} } =
     function updateAgentBrowserWorkspace(conversation) {
       const ws = conversation?.workspace || appState.workspaceRoot || "";
       notifyBrowserWorkspace(ws);
+      notifyBrowserTab(conversation?.provider === "chatgpt" ? "chatgpt" : "web");
     }
 
     async function refreshAgentDrawerMemory(conversation) {

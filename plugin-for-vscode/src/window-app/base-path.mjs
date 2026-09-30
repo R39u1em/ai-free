@@ -20,3 +20,7 @@ export function prefixUiPaths(html, basePath) {
     .replaceAll('"/embed/', `"${base}/embed/`)
     .replaceAll('img.src = src;', `img.src = src.startsWith("/api/") ? "${base}" + src : src;`);
 }
+
+export function filterRemoteMemoryItems(items, workspace) {
+  return (items || []).filter((item) => item.workspace === workspace);
+}

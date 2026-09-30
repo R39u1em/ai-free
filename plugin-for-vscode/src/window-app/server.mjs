@@ -25,6 +25,9 @@ import { conversationList, makeConversationTitle, shouldAutoTitle } from "../sta
 import { startTask, isRunning, getRunningIds, stopTask } from "./task-runner.mjs";
 import { agentPauseReason, agentRequestOptions, pausedAuthAgentRuns, recoverableAgentRuns } from "./agent-recovery.mjs";
 import { normalizeBasePath, prefixUiPaths, resolveUiRequestPath } from "./base-path.mjs";
+import { mergeVisiblePipeline, projectPipeline } from "./pipeline-scope.mjs";
+import { remoteSettingsInput, remoteSettingsResponse } from "./remote-settings.mjs";
+import { remoteUiRouteDenied } from "./remote-route-policy.mjs";
 import { getShutdownStatus, registerShutdownServerCloser, requestAppShutdown } from "../app-shutdown.mjs";
 import { getStateFile, loadWindowState, saveWindowState } from "../state/window-state.mjs";
 import { LANGUAGES, getLanguageMeta } from "../i18n/index.mjs";
@@ -41,7 +44,7 @@ import {
 } from "./http.mjs";
 import { renderWindowHtml } from "./ui-html.mjs";
 import { renderEmbedWorkspaceHtml } from "./embed-workspace.mjs";
-import { renderEmbedBrowserHtml } from "./embed-browser.mjs";
+import { preferredBrowserTab, renderEmbedBrowserHtml } from "./embed-browser.mjs";
 import {
   handleChatGPTLiveInput,
   handleChatGPTLiveStream,
@@ -69,9 +72,11 @@ import {
 } from "./provider-frame-chatgpt.mjs";
 import {
   AGENT_TASK_EMPTY_HELP,
+  applyAgentModePatch,
   buildAgentTaskOptions,
   finalizeCodeTaskMessage,
   resolveConversationAgentTask,
+  shouldRunPipeline,
 } from "./agent-task.mjs";
 import { handleMemoryRoute } from "./routes/memory.mjs";
 import { handleSkillsRoute } from "./routes/skills.mjs";
@@ -521,10 +526,11 @@ export async function runWindowApp({
     return qwenLiveModelSupportsSearch(catalog, modelId);
   }
 
-  async function runPipelineFromConversation(startConversationId, initialPrompt, requestOptions = {}, signal = null) {
+  async function runPipelineFromConversation(startConversationId, initialPrompt, requestOptions = {}, signal = null, allowedWorkspace = null) {
     const edges = state.pipeline?.edges || [];
     const configuredLeader = String(state.pipeline?.mainAgentId || "");
-    const leaderId = state.conversations.some((item) => item.id === configuredLeader)
+    const eligible = (item) => !allowedWorkspace || allowedWorkspace(item.workspace || workspaceRoot);
+    const leaderId = state.conversations.some((item) => item.id === configuredLeader && eligible(item))
       ? configuredLeader
       : startConversationId;
     const queue = [{ conversationId: leaderId, input: initialPrompt, sourceTitle: "User", depth: 0 }];
@@ -536,7 +542,7 @@ export async function runWindowApp({
       if (signal?.aborted) break;
       const item = queue.shift();
       const conversation = state.conversations.find((candidate) => candidate.id === item.conversationId);
-      if (!conversation) continue;
+      if (!conversation || !eligible(conversation)) continue;
       const visitKey = `${item.conversationId}:${item.depth}`;
       if (visited.has(visitKey)) continue;
       visited.add(visitKey);
@@ -565,7 +571,7 @@ export async function runWindowApp({
       const targets = edges
         .filter((edge) => edge.from === item.conversationId)
         .map((edge) => state.conversations.find((candidate) => candidate.id === edge.to))
-        .filter(Boolean);
+        .filter((candidate) => candidate && eligible(candidate));
       for (const target of targets) {
         queue.push({
           conversationId: target.id,
@@ -734,11 +740,7 @@ export async function runWindowApp({
         if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && origin !== "https://main.r3quiem.ru") {
           return sendJson(res, { error: "Origin denied" }, 403);
         }
-        if (url.pathname.startsWith("/v1/") || url.pathname.startsWith("/provider-frame/")
-          || ["/api/shutdown", "/api/update/run", "/api/settings/openai-key", "/api/voice/install", "/api/pipeline"].includes(url.pathname)
-          || (url.pathname === "/api/settings" && req.method !== "GET")
-          || url.pathname.startsWith("/api/plugins") || url.pathname.startsWith("/api/memory")
-          || url.pathname.startsWith("/api/diagnostics")) {
+        if (remoteUiRouteDenied(url.pathname, req.method)) {
           return sendJson(res, { error: "Unavailable through main" }, 403);
         }
         const conversationId = url.pathname.match(/^\/api\/conversations\/([^/]+)/)?.[1];
@@ -787,7 +789,10 @@ export async function runWindowApp({
       if (req.method === "GET" && url.pathname === "/embed/browser") {
         const root = url.searchParams.get("root") || (remote ? remoteRoots[0] : workspaceRoot || os.homedir());
         if (remote && !remoteWorkspaceAllowed(root)) return sendJson(res, { error: "Workspace unavailable" }, 403);
-        return sendHtml(res, prefixUiPaths(renderEmbedBrowserHtml({ root }), remote ? basePath : ""));
+        return sendHtml(res, prefixUiPaths(renderEmbedBrowserHtml({
+          root,
+          defaultTab: preferredBrowserTab(url.searchParams.get("provider")),
+        }), remote ? basePath : ""));
       }
 
       if (req.method === "GET" && url.pathname === "/embed/chatgpt") {
@@ -1180,16 +1185,21 @@ export async function runWindowApp({
           stateFile: remote ? null : getStateFile(),
           activeConversationId: visibleIds.has(state.activeConversationId) ? state.activeConversationId : null,
           conversations: conversationList({ ...state, conversations: visibleConversations }),
-          pipeline: remote ? { edges: [] } : state.pipeline || { edges: [] },
+          pipeline: remote ? projectPipeline(state.pipeline || { edges: [] }, visibleIds) : state.pipeline || { edges: [] },
           runningTaskIds: getRunningIds().filter((id) => visibleIds.has(id)),
         });
       }
 
       if (req.method === "PATCH" && url.pathname === "/api/pipeline") {
         const body = await readJsonBody(req);
-        state.pipeline = normalizePipelinePatch(body, state.conversations);
+        const visibleConversations = remote
+          ? state.conversations.filter((item) => remoteWorkspaceAllowed(item.workspace || workspaceRoot))
+          : state.conversations;
+        const patch = normalizePipelinePatch(body, visibleConversations);
+        const visibleIds = new Set(visibleConversations.map((item) => item.id));
+        state.pipeline = remote ? mergeVisiblePipeline(state.pipeline, patch, visibleIds) : patch;
         saveWindowState(workspaceRoot, state);
-        return sendJson(res, { pipeline: state.pipeline });
+        return sendJson(res, { pipeline: remote ? projectPipeline(state.pipeline, visibleIds) : state.pipeline });
       }
 
       // ===== Файловый браузер для модалки «Новый чат» =====
@@ -1299,7 +1309,7 @@ export async function runWindowApp({
         return sendJson(res, result);
       }
 
-      if (await handleMemoryRoute(req, url, res)) return;
+      if (await handleMemoryRoute(req, url, res, remote ? { workspaceAllowed: remoteWorkspaceAllowed } : {})) return;
       if (await handleSkillsRoute(req, url, res)) return;
       if (await handlePluginsRoute(req, url, res)) return;
 
@@ -1344,9 +1354,13 @@ export async function runWindowApp({
 
       if (req.method === "GET" && url.pathname === "/api/diagnostics") {
         return sendJson(res, await collectDiagnostics({
-          workspaceRoot,
-          state,
-          runningTaskIds: getRunningIds(),
+          workspaceRoot: remote ? remoteRoots[0] : workspaceRoot,
+          state: remote ? {
+            ...state,
+            conversations: state.conversations.filter((item) => remoteWorkspaceAllowed(item.workspace || workspaceRoot)),
+            activeConversationId: remoteWorkspaceAllowed(state.conversations.find((item) => item.id === state.activeConversationId)?.workspace || "") ? state.activeConversationId : "",
+          } : state,
+          runningTaskIds: remote ? getRunningIds().filter((id) => state.conversations.some((item) => item.id === id && remoteWorkspaceAllowed(item.workspace || workspaceRoot))) : getRunningIds(),
         }));
       }
 
@@ -1359,13 +1373,13 @@ export async function runWindowApp({
 
       if (req.method === "PUT" && url.pathname === "/api/settings") {
         const body = await readJsonBody(req);
-        const saved = saveSettings({
+        const saved = saveSettings(remote ? remoteSettingsInput(body) : {
           allowedCommands: body.allowedCommands,
           commandPermissions: body.commandPermissions,
           ui: body.ui,
           telegram: body.telegram,
         });
-        return sendJson(res, {
+        return sendJson(res, remote ? remoteSettingsResponse(saved) : {
           allowedCommands: saved.allowedCommands,
           commandPermissions: saved.commandPermissions,
           ui: saved.ui,
@@ -1485,17 +1499,7 @@ export async function runWindowApp({
         if (typeof body.roleId === "string") {
           conversation.roleId = normalizeRoleId(body.roleId);
         }
-        if (typeof body.pipelineMode === "boolean") {
-          conversation.pipelineMode = body.pipelineMode;
-        }
-        if (typeof body.coderMode === "boolean") {
-          conversation.coderMode = body.coderMode;
-          if (!body.coderMode) conversation.hardwareMode = false;
-        }
-        if (typeof body.hardwareMode === "boolean") {
-          conversation.hardwareMode = body.hardwareMode;
-          if (body.hardwareMode) conversation.coderMode = true;
-        }
+        applyAgentModePatch(conversation, body);
         if (typeof body.memoryEnabled === "boolean") {
           conversation.memoryEnabled = body.memoryEnabled;
         }
@@ -1668,7 +1672,7 @@ export async function runWindowApp({
           source: userMessageSource || "desktop",
           promptChars: prompt.length,
           imageCount: storedImages.length,
-          pipeline: body.pipeline === true || conversation.pipelineMode === true,
+          pipeline: shouldRunPipeline(conversation, body, prompt),
           coderMode: body.coderMode === true || conversation.coderMode === true,
           searchEnabled: body.searchEnabled === true,
         });
@@ -1682,7 +1686,7 @@ export async function runWindowApp({
         });
         conversation.pendingQuestion = null;
 
-        if (body.pipeline === true || conversation.pipelineMode === true) {
+        if (shouldRunPipeline(conversation, body, prompt)) {
           if (isRunning(conversation.id)) {
             conversation.messages.push({
               role: "assistant",
@@ -1704,7 +1708,7 @@ export async function runWindowApp({
           state.activeConversationId = conversation.id;
           saveWindowState(workspaceRoot, state);
           startTask(conversation.id, "pipeline", async (signal) => {
-            await runPipelineFromConversation(conversation.id, prompt, body, signal);
+            await runPipelineFromConversation(conversation.id, prompt, body, signal, remote ? remoteWorkspaceAllowed : null);
           }, "Pipeline");
           return sendJson(res, { conversation, running: true });
         }

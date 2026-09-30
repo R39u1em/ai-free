@@ -30,6 +30,15 @@ The UI LaunchAgent `com.kirill.aifree-server` runs this checkout with
 supports other workspaces. The remote UI limits workspace selection to that
 root, requires the expected Origin on writes, omits stored credentials from
 settings responses, and blocks server administration and API-key routes.
+The protected web UI can configure command permissions, plugins, diagnostics,
+voice, pipeline and workspace-scoped memory. Destructive actions and writes
+outside the selected workspace remain behind the existing permission review;
+opening the settings page does not enable them automatically. Coder, ESP and
+Pipeline are mutually exclusive when selected in a conversation, and explicit
+`/code` or browser requests run their respective agent even if an older
+conversation still records Pipeline mode. DeepSeek and Qwen use the shared Web
+tab in the embedded browser; ChatGPT uses its own browser tab. The live Web
+stream begins after browser warm-up and retries a failed first frame.
 Keep the Caddy route restricted to `/ai-free` and `/ai-free/*`, with the
 existing client-certificate allowlist. Do not expose port 4317 or 4318
 directly to the network.
@@ -52,6 +61,8 @@ the provider login from AI Free to continue it.
 
 Run `npm test` and `npm run check:ci` in this checkout. A synthetic DeepSeek
 `/code` task completed a file write and final answer through the live Mac
-service on 2026-09-30. Qwen's live task could not complete because its login
-timed out without a valid session. Neither test proves that providers will
+service on 2026-09-30. A DeepSeek browser agent reached `example.com` through
+the protected web route. The UI's first browser frame recovered after a forced
+HTTP 503 at desktop and mobile widths. Qwen's live task could not complete
+because its login timed out without a valid session. Neither test proves that providers will
 accept unlimited or prolonged use; respect provider terms and account limits.
